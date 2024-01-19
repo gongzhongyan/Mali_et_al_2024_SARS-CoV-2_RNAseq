@@ -1,0 +1,1398 @@
+---
+title: "2024.01.DEseq_SARS-CoV-2_infected"
+author: "Zhongyan"
+date: "2024-01-19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Load Packages
+```{r Load library, include=FALSE}
+# Load library 
+library(tidyverse)
+library(DESeq2)
+library(annotables)
+library(org.Mm.eg.db)
+library(pheatmap)
+library(EnhancedVolcano)
+library(clusterProfiler)
+library(ggbreak)
+library(stringr)
+library(scales)
+library(patchwork)
+library(ComplexHeatmap)
+library(enrichplot)
+library(msigdbr)
+library(mclust)
+```
+Load the STAR aligned count matrix. Verify and Quality check the sample distance to figure out the outlier samples.
+#0. Check outlier
+```{r Load data & package,include=FALSE}
+### Read data
+writepath <- "your/OUTPUTdirectory/here"
+filepath<-"/RNA/Matrix/metaData/directory"
+metadata_infected <-  read.csv(paste0(filepath,"/metadata_infectedMouseTG_WT.csv"),row.names = 1, header = TRUE, stringsAsFactors=FALSE)
+expMatrix_infectedr <- read.csv(paste0(filepath,"/expMatrix_infectedMouseTG_WT.csv"),row.names = 1, header = TRUE, stringsAsFactors=FALSE)
+```
+```{r, infected TG size factor estimatin, include=FALSE}
+sample <- rownames_to_column(metadata_infected, var="sample")$sample
+expMatrix_infectedr <- expMatrix_infectedr[,sample]
+all(rownames(metadata_infected) == colnames(expMatrix_infectedr))
+ddsi <- DESeqDataSetFromMatrix(expMatrix_infectedr,
+                              metadata_infected,
+                              design = ~Condition)
+## Normalize counts
+ddsi_norm <- estimateSizeFactors(ddsi)
+sizeFactors(ddsi_norm)
+normalized_counts_i <- counts(ddsi_norm, normalized=TRUE)
+vsdi <- vst(ddsi_norm, blind = TRUE)
+
+## Extract the vsd matrix, compute pairwise correlation values and generate pheatmap
+annotation_column_i = data.frame(condition=dplyr::select(metadata_infected, Condition), genotype_i=dplyr::select(metadata_infected, Genotype))
+
+```
+```{r}
+vsdi %>% 
+  assay() %>% 
+  cor() %>% 
+  pheatmap(annotation_col = annotation_column_i)
+```
+
+```{r}
+library(rrcov)
+pca2 <- PcaGrid(t(assay(vsdi)))
+screeplot(pca2)
+perc_eng <- pca2$eigenvalues/sum(pca2$eigenvalues)
+sum(perc_eng[1:2])/sum(perc_eng)
+
+pc2 <- PcaGrid(t(assay(vsdi)),k=6)
+which(pc2@flag=='FALSE')
+pca.scoreplot(pc2, id.n=1, )
+plot(pc2, main="pcaGrid Oulier map with vsd")
+boxplot(assay(vsdi))
+rm(pca2, pc2, vsdi)
+```
+##0.1 Get rid of outlier
+```{r}
+Outlier_i= c("in3127_23")
+metadata_infected <- metadata_infected[!(rownames(metadata_infected) %in% Outlier_i), ]
+expMatrix_infected <- expMatrix_infectedr[,!(names(expMatrix_infectedr) %in% Outlier_i)]
+rm(expMatrix_infectedr)
+```
+
+# 1. Running DEseq
+```{r}
+# Infected TG
+all(rownames(metadata_infected) == colnames(expMatrix_infected))
+
+ddsi <- DESeqDataSetFromMatrix(expMatrix_infected,
+                               metadata_infected,
+                               design = ~ Condition)
+ddsi$Condition <- relevel(ddsi$Condition, ref = 'Mock infected')
+ddsi.deseq <- DESeq(ddsi)
+```
+```{r}
+resultsNames(ddsi.deseq)
+```
+
+```{r}
+extract_DE_results <- function(dds,dds.deseq, resultName, p=0.05, fold = 0.2, count = 10) { 
+ 
+  DE_results <- results(dds.deseq,name=resultName)
+  plotMA(DE_results, ylim=c(-2,2))
+  resOrdered<- DE_results[order(DE_results$padj), ]
+  res <- data.frame(resOrdered) %>% rownames_to_column(var = "ensgene") 
+  res <-  res %>% 
+    left_join(grcm38[ ,c("ensgene", "symbol", "description")], 
+              by = "ensgene")
+  sig <- res %>% 
+    as.data.frame() %>% 
+    dplyr::filter(padj <= p)
+  sig <-  sig %>% .[abs(.$log2FoldChange) > fold,] %>%
+   .[.$baseMean > count, ]  %>%
+  .[order(.$log2FoldChange),]
+  
+  upGenes <- sig[sig$log2FoldChange > fold,]
+  downGenes <- sig[sig$log2FoldChange < -fold,]
+  
+  return(list(res=res,sig=sig,upGenes=upGenes,downGenes=downGenes))
+}
+```
+
+#### infected results
+```{r}
+DE_results_infected_mock = extract_DE_results(ddsi,ddsi.deseq, "Condition_SARS.CoV.2.infected_vs_Mock.infected", p=0.01, fold = 0.37, count = 152)# log2(1.3) fold change is about 0.378, count 152 are taken by demixture the baseMean count distribution below
+infected_mock_sig = DE_results_infected_mock$sig 
+infected_res = DE_results_infected_mock$res
+infected_up = DE_results_infected_mock$upGenes
+infected_down = DE_results_infected_mock$downGenes
+```
+```{r plot baseMean distribution}
+hist(log(infected_res$baseMean), 
+     main = "Histogram of base genes expression in the samples",
+     xlab = "log normalized count values",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )  # You can specify the number of breaks or bins here
+#xlim = c(0, 2000)
+
+```
+```{r}
+
+df <- infected_res[infected_res$baseMean != 0,]
+# Fit a mixture model with two normal distributions
+y<- log(df$baseMean)
+yBIC <- mclustBIC(y, G=2, modelNames="V")
+yModel = mclustModel(y, yBIC)
+
+# Print the parameter estimates
+yModel$parameters$mean
+yModel$parameters$variance$sigmasq
+```
+```{r}
+exp(yModel$parameters$mean[2] - 2*yModel$parameters$variance$sigmasq[2])
+```
+```{r}
+exp(yModel$parameters$mean[1] + 2*yModel$parameters$variance$sigmasq[1])
+#2 sd away is 95% of the population
+```
+
+
+```{r save sig gene list, include=FALSE}
+# write.csv(infected_mock_sig,"infected_mock_sig_0.05.csv",row.names = TRUE, col.names = TRUE)
+```
+
+##1.2 Load TPM
+```{r load TPM}
+##See code file 'CalculateTPM.R' for calculating the TPM
+path2 <- "/TPM/filepath"
+infected_tpm <- read.csv(paste0(path2,"/MusMusculus_INFECTED_tpm.csv"),row.names = 1, header = TRUE, stringsAsFactors=FALSE)
+```
+
+# 2. Perform GSEO analysis
+
+```{r}
+# prepare the dataframe
+# 1st column gene ID; 2nd col FC
+inf_foldC <- dplyr::select(infected_down, c("symbol","log2FoldChange")) %>% # "symbol" ensgene #infected_mock_sig
+  .[order(.$log2FoldChange, decreasing = TRUE),]
+geneList <- inf_foldC[,2]
+names(geneList) = as.character(inf_foldC[,1])
+# geneList = sort(geneList, decreasing = TRUE)
+organism <- 'org.Mm.eg.db'
+gse_bp <- gseGO(geneList = geneList, 
+             ont ="BP", 
+             keyType = "SYMBOL", #ENSEMBL
+             nPerm = 10000, #permutation test
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")#none
+```
+## 2.1 Dotplot
+```{r, include=FALSE}
+require(DOSE)
+```
+```{r}
+g <- dotplot(gse_bp, showCategory=5, split=".sign") + facet_grid(.~.sign)
+g
+filename <- paste0(writepath,"/GSEBiologicalProcessDotplot_111423_v2.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width =3000, height = 2000, g)
+rm(g, filename)
+```
+
+```{r}
+gse_mf <- gseGO(geneList = geneList, 
+             ont ="MF", 
+             keyType = "SYMBOL", #ENSEMBL
+             nPerm = 10000, #permutation test
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+```
+```{r}
+g <- dotplot(gse_mf, showCategory=5, split=".sign") + facet_grid(.~.sign)
+g
+filename <- paste0(writepath,"/GSEMolecularFunctionDotplot_111423_v2.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width =3000, height = 2000, g)
+rm(g, filename)
+```
+```{r}
+s_go <- gse_bp@result %>% 
+  filter(enrichmentScore >0) %>%
+  filter(setSize>60) %>%
+  arrange(desc(enrichmentScore)) %>%
+  head(8)
+level <- s_go$Description
+s_go$Description <- factor(s_go$Description, levels = level)
+s_go$direction <- "Activated"
+
+s_go2 <- gse_bp@result %>% 
+  filter(enrichmentScore < 0) %>%
+  filter(setSize>60) %>%
+  filter(setSize<200) %>%
+  # arrange(desc(enrichmentScore)) %>%
+  .[order(.$enrichmentScore),] %>%
+  head(5)
+s_go2$direction <- "Supressed"
+# level <- s_go$Description
+# s_go$Description <- factor(s_go$Description, levels = level)
+  s_go3 <- rbind(s_go, s_go2)
+```
+```{r}
+g <- ggplot(data = s_go3, aes(x = enrichmentScore, y = Description, 
+                        color = `p.adjust`, size = setSize)) +
+  # facet_grid(. ~ direction) +
+  geom_point() +
+  scale_color_gradient(low = "red", high = "blue") +
+  theme_bw() + 
+  ylab("") + 
+  xlab("Enrichment Score") + 
+  ggtitle("GO enrichment analysis: top Supressed and Activated Biological Process terms")+ 
+  # scale_x_break(c(-0.6, -0.4), scales=-0.5)+
+  # scale_x_break(c(0.1, 0.45), scales=0.5)+
+  # scale_x_discrete(guide = guide_axis(n.dodge=3))+
+  theme(axis.text.x = element_text(color = "black"),
+        axis.text.y = element_text(color = "black", size=18),
+        text = element_text(size=18))
+g
+filename <- paste0(writepath,"/GSEABiologocalPorcess_111423_v3.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width = 3400, height = 2000, g)
+rm(g, filename)
+```
+
+
+```{r}
+gse_cc <- gseGO(geneList = geneList, 
+             ont ="CC", 
+             keyType = "SYMBOL", #ENSEMBL
+             nPerm = 10000, #permutation test
+             minGSSize = 3, 
+             maxGSSize = 800, 
+             pvalueCutoff = 0.05, 
+             verbose = TRUE, 
+             OrgDb = organism, 
+             pAdjustMethod = "BH")
+```
+```{r}
+g <- dotplot(gse_cc, showCategory=5, split=".sign") + facet_grid(.~.sign)
+g
+filename <- paste0(writepath,"/GSECellularComponentDotplot_111423_v2.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width =3000, height = 2000, g)
+rm(g, filename)
+```
+## 2.2 Encrichment Map:
+```{r}
+gse2 <- pairwise_termsim(gse_mf, method = "JC", semData = NULL, showCategory = 200)
+g <- emapplot(gse2, showCategory = 50)
+g
+filename <- paste0(writepath,"/1b.infected.GSE.EnriMap1.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width = 10000, height = 4000, g)
+rm(g, filename)
+```
+## 2.3 Category Netplot
+```{r}
+# categorySize can be either 'pvalue' or 'geneNum'
+g <- cnetplot(gse_mf, categorySize="pvalue", foldChange=geneList, showCategory = 10)
+# g2 <- cnetplot(gse, categorySize="geneNum", foldChange=geneList, showCategory = 10)
+# g = arrangeGrob(g1,g2, ncol = 2)
+g
+filename <- paste0(writepath,"/1c.infected.GSE.CatNetplot1.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width = 3000, height = 4000, g)
+rm(g, filename)
+```
+# 3. Plot genes by categories
+### 3.0 Exact permutation test
+Testing drawing from the nocieceptive genes expressed in the TG, how often we get these sets of genes are up and down 0.5.
+
+From Walsh et al,2019 https://doi.org/10.7554/eLife.48448
+"Genes were clustered into functional groups and significance was evaluated using a permutation test. Briefly, we first tabulated the absolute value of the log2 fold change of gene expression (between MC903 and EtOH) of each gene in a given group of n genes in turn, and then we calculated the median of these fold change values, ztrue. We then drew n random genes from the set of all genes detected in the samples and computed the median log2 fold change as above using this null set, znull. Repeating the latter 10,000 times established a null distribution of median log2 fold change values; we took the proportion of resampled gene groups that exhibited (ztrue ≥znull) as an empirical p-value reporting the significance of changes in gene expression for a given group of n genes."
+```{r}
+permutate_foldchange <- function(test_median, whole_median_list, sampling_size, sampling=1e4) {
+  #Test median should be absolute value
+  distribution <- numeric(sampling)
+for (i in 1:sampling) {
+  x <- sample(abs(whole_median_list), size=sampling_size)
+  distribution[i]=median(x)
+  p = sum(distribution>=test_median)/sampling
+}
+  return(list(distribution,p))
+}
+```
+## 3.1 immune response gene
+```{r}
+Mouse_immune_response <- readxl::read_excel("/GO_term_summary_IMMUNE_RESPONSE_20220716_000453.xlsx") %>% 
+  pull(Symbol) %>%
+  unique()
+immuneGene <- Reduce(intersect,list(infected_mock_sig$symbol, Mouse_immune_response))
+```
+
+```{r}
+imm <- infected_mock_sig %>%
+  .[.$symbol %in% immuneGene, ] %>%
+  filter(., log2FoldChange>1) %>%
+  .[order(-.$log2FoldChange),]
+dup_rows <- duplicated(imm$symbol)
+# Remove duplicated rows
+imm <- imm[!dup_rows, ]
+```
+
+```{r}
+y <- imm %>%
+  .[,c("log2FoldChange","symbol")] %>%
+  .[order(-.$log2FoldChange),]
+
+names <- y$symbol
+y$symbol <- NULL
+rownames(y) <-names
+colnames(y)[1] <- 'log2 fold change'
+uprows <- imm %>% .[.$log2FoldChange>0,] %>% dim() %>% .[1]
+```
+```{r}
+paletteLength <- 50
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(y), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(y)/paletteLength, max(y), length.out=floor(paletteLength/2)))
+g <- pheatmap(y,
+         gaps_row = uprows,
+         cluster_cols=FALSE,
+         cluster_rows=FALSE,
+         fontsize = 20,
+         color=colorRampPalette(c("white", "tomato1"))(50),
+         breaks=myBreaks)
+g
+filename <- paste0(writepath,"/immuneHeatmap_111523_v3.pdf")
+pdf(filename, width = 3, height = 20)
+print(g)
+dev.off()
+rm(g, filename)
+```
+## 3.2 neuropeptide heatmap
+This only include the peptide itself not the receptors
+```{r}
+pep <- readxl::read_excel("/GO_term_summary_neuropeptides.xlsx") %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+pept <- infected_mock_sig %>%
+  # filter(., padj<0.05) %>%
+  .[.$symbol %in% pep, ] %>%
+  # .[.$baseMean > 0, ]  %>%#42
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+# write.csv(pept,"neuropeptide_infection.csv",row.names = TRUE, col.names = TRUE)
+```
+
+```{r}
+y <- pept %>%
+  .[,c("log2FoldChange","symbol")] %>%
+  .[order(-.$log2FoldChange),]
+names <- y$symbol
+y$symbol <- NULL
+rownames(y) <-names
+colnames(y)[1] <- 'log2 fold change'
+uprows <- pept %>% .[.$log2FoldChange>0,] %>% dim() %>% .[1]
+```
+```{r}
+paletteLength <- 50
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(y), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(y)/paletteLength, max(y), length.out=floor(paletteLength/2)))
+g <- pheatmap(y,
+         gaps_row = uprows ,
+         cluster_cols=FALSE,
+         cluster_rows=FALSE,
+         fontsize = 20,
+         color=colorRampPalette(c("slateblue1", "white", "tomato1"))(50),
+         breaks=myBreaks)
+g
+filename <- paste0(writepath,"/peptideHeatmap_111523_v3.pdf")
+pdf(filename, width = 3, height = 4)
+print(g)
+dev.off()
+rm(g, filename)
+```
+```{r}
+path<-"path/neuropeptide/term"
+
+pep <- readxl::read_excel(paste0(path,"/GO0007218_term_summary_20231115_230614.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+pep_tg <- infected_res %>%
+  .[.$symbol %in% pep, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(pep_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(pep_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, neuropeptide",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+     xlim = c(0,0.75)
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(pep_tg)[1]
+```
+The median log2 fold change and p value came out of the permupation test were collected to PRISM to plot.
+
+## 3.3 Pain
+```{r}
+path<-"path/to/GO_terms/pain"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0019233_term_summary_20231030_121233.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0048265_term_summary_20231030_121359.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p3 <- readxl::read_excel(paste0(path,"/GO0048266_term_summary_20231030_121702.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p4 <- readxl::read_excel(paste0(path,"/GO0050965_term_summary_20231030_121458.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p5 <- readxl::read_excel(paste0(path,"/GO0048266_term_summary_20231030_121702.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+pain <- c(p1, p2, p3, p4, p5)
+rm(p1, p2, p3, p4, p5)
+```
+Stringent method: p=0.01, fold = 0.37, count = 152
+```{r}
+pain_s <-infected_mock_sig%>%
+  .[.$symbol %in% pain, ] %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+pain_los <- infected_res %>%
+  filter(., padj<0.05) %>%
+  .[.$symbol %in% pain, ] %>%
+  .[.$baseMean > 0, ] %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+
+```{r}
+pa_mm <- infected_res %>%
+  .[.$symbol %in% pain, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+# write.csv(pept,"pain_infection.csv",row.names = TRUE, col.names = TRUE)
+```
+####3.3.1 Pie
+```{r}
+sub1_size <- pain_s %>% #pain_los
+  filter(log2FoldChange > 0) %>%
+  .$symbol %>%
+  length()
+sub2_size <- pain_s %>% #pain_los
+  filter(log2FoldChange < 0) %>%
+  .$symbol %>%
+  length()
+remaining_size <- dim(pa_mm)[1] - (sub1_size + sub2_size)#length(pain)
+data <- data.frame(
+  Category = c("upregulated", "downregulated", "not sig"),
+  Size = c(sub1_size, sub2_size, remaining_size)
+)
+```
+```{r}
+pie_labels <- paste0(data$Size, " = ","\n", round(100 * data$Size/sum(data$Size), 2), "%")
+ngene <- data$Size
+pect <- paste0(round(100 * data$Size/sum(data$Size), 2), "%")
+g <- ggplot(data, aes(x = "", y = Size, fill = Category)) +
+  geom_bar(stat = "identity", col = 'black') +
+  scale_fill_manual(values = c("slateblue1", "white","tomato1")) + #light blue
+  coord_polar(theta = "y") +
+  theme_void() +
+  geom_text(aes(x=1.7,y = Size),
+            label = pie_labels , size=5,
+            position = position_stack(vjust = 0.5))+
+  ggtitle("132 pain related genes expressed in TG,  \nstringent cut p=0.05, log2fold >0, count >0")
+g
+filename <- paste0(writepath,"/NocicepetionPie_111523_v5.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width = 2000, height = 2000, g)
+rm(g, filename)
+```
+
+#### 3.3.2 permutation for genes are significantly expressed
+```{r sampling function}
+sampling_genes <- function(complete_list, sampling_size, compare_list, joint_list_length,  sampling=1e4) {
+  chances <- numeric(sampling)
+for (i in 1:sampling) {
+  x <- sample(complete_list, size=sampling_size)
+  if(sum(x %in% compare_list) >= joint_list_length) {chances[i]=1
+  #print(sum(x %in% compare_list))
+  }
+}
+  return(sum(chances))
+}
+```
+Below sampling 31 genes from the significant genes list, testing if nociception pathway, with drawing 132 nociceptive genes that are expressed in the TG are significantly changed
+```{r}
+sig_l <- infected_mock_sig %>%
+  dim()%>%
+  .[1]
+sampling = 100000
+x<- sampling_genes(infected_res$symbol, sampling_size=sig_l, pa_mm$symbol, 32, sampling=sampling) # p < 1/1e5# (sub1_size + sub2_size) #pain
+x
+# stringent up+down  p < 0.00001
+```
+
+```{r permutation function, distribution of sig genes}
+permutate_smallsets <- function(complete_list, sampling_size, compare_list, test_no_genes, sampling=1e4) {
+  distribution <- numeric(sampling)
+for (i in 1:sampling) {
+  x <- sample(complete_list, size=sampling_size)
+  distribution[i]=sum(x %in% compare_list)
+  p = sum(distribution>=test_no_genes)/sampling
+}
+  return(list(distribution,p))
+}
+```
+Small circle method: Sample 132 genes (number of nociecptive genes expressed in TG) from 57,115 genes expressed in TG. Count the number of genes that are significant to make the null distribution. Find where the number of 32 sig genes by sampling 132 genes 100,000 times lay in the distribution. 
+```{r}
+sampling = 100000
+x<-permutate_smallsets(infected_res$symbol, sampling_size=132, infected_mock_sig$symbol, 32, sampling=sampling)
+```
+```{r}
+hist(x[[1]], 
+     main = "Histogram of null median expression, nocieception 132",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=32, lwd=3, col="red")
+```
+Big circle method: Sample 2453 significantly expressed genes from 57,115 genes expressed in TG. Count the number of genes that are in TG expressed nocieceptive gens (132 genes) to make the null distribution. Find where the number of 32 sig genes by sampling 2453 genes 100,000 times lay in the distribution. 
+```{r}
+sampling = 100000
+x<-permutate_smallsets(infected_res$symbol, sampling_size=sig_l, pa_mm$symbol, 32, sampling=sampling)
+```
+```{r}
+hist(x[[1]], 
+     main = "Histogram of null median expression, nocieception 132",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=32, lwd=3, col="red")
+```
+Test the nocieception term that are significant.
+Below tests of the significantlt expressed genes in nocieception term are changed
+```{r}
+ztrue <- median(abs(pain_los$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(pain_los)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, nocieception 60",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+Test all genes in nocieceptive term is significant
+```{r}
+ztrue <- median(abs(pa_mm$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(pa_mm)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, nocieception 132",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+Below sampling 60 genes from the significant genes list with a loose criteria, testing if nociception pathway genes are significantly changed
+```{r loose criteria}
+sig_l <- infected_res %>%
+  filter(padj <0.05) %>%
+  dim()%>%
+  .[1]
+sampling = 100000
+x<- sampling_genes(infected_res$symbol, sampling_size=sig_l, pa_mm$symbol, 60, sampling=sampling) # p < 1/1e5# (sub1_size + sub2_size)
+x/sampling
+## loose up+down  p < 0.00001
+```
+
+#### 3.3.3 heatmap
+Fold Change heatmap
+```{r}
+y <- pain_s %>%
+  .[,c("log2FoldChange","symbol")] %>%
+  .[order(-.$log2FoldChange),]
+
+names <- y$symbol
+y$symbol <- NULL
+rownames(y) <-names
+colnames(y)[1] <- 'log2 fold change'
+uprows <- pain_s %>% .[.$log2FoldChange>0,] %>% dim() %>% .[1]
+```
+```{r}
+paletteLength <- 50
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(y), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(y)/paletteLength, max(y), length.out=floor(paletteLength/2)))
+g <- pheatmap(y,
+         gaps_row = uprows,
+         cluster_cols=FALSE,
+         cluster_rows=FALSE,
+         fontsize = 20,
+         color=colorRampPalette(c("slateblue1", "white", "tomato1"))(50),
+         breaks=myBreaks)
+g
+filename <- paste0(writepath,"/NociceptionHeatmap_111523_v4.pdf")
+pdf(filename, width = 3, height = 12)
+print(g)
+dev.off()
+rm(g, filename)
+```
+
+## 3.4 Itch 
+#### 3.4.1 pie
+```{r}
+path<-"path/to/itch_GO"
+
+itch <-  read.csv(paste0(path,"/itch_Usoskin_2015.csv"), header = FALSE) %>% .$V1
+```
+```{r}
+it <- infected_res %>%
+  filter(., padj<0.05) %>%
+  .[.$symbol %in% itch, ] %>%
+  .[.$baseMean > 0, ]  %>%#42
+  arrange(desc(log2FoldChange), symbol)
+# it_s <-infected_mock_sig%>%
+#   .[.$symbol %in% itch, ] %>%
+#   arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+it_mm <- infected_res %>%
+  .[.$symbol %in% itch, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+sub1_size <- it %>%
+  filter(log2FoldChange > 0) %>%
+  .$symbol %>%
+  length()
+sub2_size <- it %>%
+  filter(log2FoldChange < 0) %>%
+  .$symbol %>%
+  length()
+remaining_size <- length(it_mm$symbol) - (sub1_size + sub2_size)#length(pain)#dim(it)[1]
+data <- data.frame(
+  Category = c("upregulated", "downregulated", "not in TG culture"),
+  Size = c(sub1_size, sub2_size, remaining_size)
+)
+pie_labels <- paste0(data$Size, " = ","\n", round(100 * data$Size/sum(data$Size), 2), "%")
+```
+
+```{r}
+ngene <- data$Size
+pect <- paste0(round(100 * data$Size/sum(data$Size), 2), "%")
+g <- ggplot(data, aes(x = "", y = Size, fill = Category)) +
+  geom_bar(stat = "identity", col = 'black') +
+  scale_fill_manual(values = c("slateblue1", "white","tomato1")) + #light blue
+  coord_polar(theta = "y") +
+  theme_void() +
+  geom_text(aes(x=1.7,y = Size),
+            label = pie_labels , size=5,
+            position = position_stack(vjust = 0.5))+
+  ggtitle("36 itch related genes expressed in TG,  \nloose cut p=0.05, log2fold >0, count >0")
+g
+filename <- paste0(writepath,"/ItchPie_111523_v3.pdf")
+ggsave(filename, limitsize = FALSE, units = "px", width = 2000, height = 2000, g)
+rm(g, filename)
+```
+```{r bootstraping}
+sig_l <- infected_res %>%
+  filter(padj <0.05) %>%
+  dim()%>%
+  .[1]
+sampling = 100000
+x <- sampling_genes(infected_res$symbol, sampling_size=sig_l, it_mm$symbol, 12, sampling=sampling) # p < 1/1e5# (sub1_size + sub2_size)#itch
+x/sampling
+# itch p < 0.00016
+```
+
+#### 3.4.2 heatmap
+```{r}
+y <- it %>% #infected_res
+  .[,c("log2FoldChange","symbol")] %>%
+  .[order(-.$log2FoldChange),]
+
+names <- y$symbol
+y$symbol <- NULL
+rownames(y) <-names
+colnames(y)[1] <- 'log2 fold change'
+uprows <- it %>% .[.$log2FoldChange>0,] %>% dim() %>% .[1]
+```
+```{r}
+paletteLength <- 50
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(y), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(y)/paletteLength, max(y), length.out=floor(paletteLength/2)))
+g <- pheatmap(y,
+         gaps_row = uprows,
+         cluster_cols=FALSE,
+         cluster_rows=FALSE,
+         fontsize = 20,
+         color=colorRampPalette(c("slateblue1", "white", "tomato1"))(50),
+         breaks=myBreaks)
+g
+filename <- paste0(writepath,"/ItchHeatmap_111523_v1.pdf")
+pdf(filename, width = 3, height = 6)
+print(g)
+dev.off()
+rm(g, filename)
+```
+```{r itch and pain list intersect}
+intersect(itch,pain)
+```
+ permutation
+```{r}
+ztrue <- median(abs(it$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(it)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, itch 36",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+```{r}
+ztrue <- median(abs(it_mm$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(it)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, itch",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+
+
+## 3.5 muscle development 
+
+```{r}
+path<-"path/to/muscledevelopmentGO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0007521_term_summary_20231111_131255.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0048741_term_summary_20231111_131228.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p3 <- readxl::read_excel(paste0(path,"/GO0055002_term_summary_20231111_131148.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p4 <- readxl::read_excel(paste0(path,"/GO2001014_term_summary_20231111_131318.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+mude <- c(p1, p2, p3, p4)
+rm(p1, p2, p3, p4)
+```
+```{r}
+mude_s <-infected_mock_sig%>%
+  .[.$symbol %in% mude, ] %>%
+  arrange(desc(log2FoldChange), symbol)
+mude_los <- infected_res %>%
+  filter(., padj<0.05) %>%
+  .[.$symbol %in% mude, ] %>%
+  .[.$baseMean > 0, ] %>%
+  arrange(desc(log2FoldChange), symbol)
+
+mude_tg <- infected_res %>%
+  .[.$symbol %in% mude, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+sig_l <- infected_mock_sig %>%
+  dim()%>%
+  .[1]
+sampling = 100000
+x<- sampling_genes(infected_res$symbol, sampling_size=sig_l, mude_tg$symbol, 18, sampling=sampling) # p < 1/1e5# (sub1_size + sub2_size) #pain
+x/sampling
+# stringent up+down  p < 0.00005
+```
+#### 3.5.1 permutation
+permutation
+```{r}
+ztrue <- median(abs(mude_los$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(mude_los)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, muscle development 138",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+```{r}
+ztrue <- median(abs(mude_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(mude_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, itch",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+```
+## 3.6 ATP
+```{r}
+path<-"path/to/ATP.GO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0006754_term_summary_20231108_160113.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0015986_term_summary_20231111_130347.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p3 <- readxl::read_excel(paste0(path,"/GO0015991_term_summary_20231111_130440.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p4 <- readxl::read_excel(paste0(path,"/GO0046034_term_summary_20231111_130416.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+atp <- c(p1, p2, p3, p4)
+rm(p1, p2, p3, p4)
+```
+```{r}
+atp_s <-infected_mock_sig%>%
+  .[.$symbol %in% atp, ] %>%
+  arrange(desc(log2FoldChange), symbol)
+atp_tg <- infected_res %>%
+  .[.$symbol %in% atp, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+sig_l <- infected_mock_sig %>%
+  dim()%>%
+  .[1]
+sampling = 100000
+x<- sampling_genes(infected_res$symbol, sampling_size=sig_l, atp_tg$symbol, 43, sampling=sampling) # p < 1/1e5# (sub1_size + sub2_size) #pain
+x
+# stringent up+down  p < 0.00001
+```
+#### 3.6.1 Permutation
+```{r}
+ztrue <- median(abs(atp_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(atp_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, ATP 293",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(atp_tg)[1]
+```
+
+## 3.7 inflammation Usoskin
+```{r}
+path<-"path/to/inflammation/GO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0006954_term_summary_20231115_225547.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0050728_term_summary_20231115_225613.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+inf <- c(p1, p2)
+rm(p1,p2)
+```
+```{r}
+inf_tg <- infected_res %>%
+  .[.$symbol %in%inf, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(inf_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(inf_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, inflammation 723",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(inf_tg)[1]
+```
+## 3.8 temperature
+```{r}
+path<-"path/to/temperatureGO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0016048_term_summary_20231115_234806.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0050951_term_summary_20231115_234729.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p3 <- readxl::read_excel(paste0(path,"/GO0050961_term_summary_20231115_234701.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+tem <- c(p1, p2, p3)
+rm(p1,p2,p3)
+```
+```{r}
+tem_tg <- infected_res %>%
+  .[.$symbol %in%tem, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(tem_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(tem_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, temperature 70",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(tem_tg)[1]
+```
+## 3.9 mechanical stim
+```{r}
+path<-"path/to//mechanicalstimGO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0050966_term_summary_20231115_235057.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0050974_term_summary_20231115_235004.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p3 <- readxl::read_excel(paste0(path,"/GO0050982_term_summary_20231115_235032.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+mec <- c(p1, p2, p3)
+rm(p1,p2, p3)
+```
+```{r}
+mec_tg <- infected_res %>%
+  .[.$symbol %in%mec, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(mec_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(mec_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, mechanical stim 68",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(mec_tg)[1]
+```
+
+## 3.10 neurofilament
+```{r}
+path<-"path/to/neurofilamentGO"
+
+nfil <- readxl::read_excel(paste0(path,"/GO0060052_term_summary_20231115_225736.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+nfil_tg <- infected_res %>%
+  .[.$symbol %in%nfil, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(nfil_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(nfil_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, neurofilament 11",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(nfil_tg)[1]
+```
+## 3.11 cell respiration
+```{r}
+path<-"path/to/cellrespirationGO"
+
+cellres <- readxl::read_excel(paste0(path,"/GO0045333_term_summary_20231111_130810.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+```
+```{r}
+cellres_tg <- infected_res %>%
+  .[.$symbol %in%cellres, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(cellres_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(cellres_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, cell respiration 235",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100,
+     xlim = c(0,0.5)
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(cellres_tg)[1]
+```
+
+## 3.12 cortico-spinal
+```{r}
+path<-"path/to/corticospinalGO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0021957_term_summary_20231115_225233.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0021966_term_summary_20231115_225430.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+cs <- c(p1, p2)
+rm(p1,p2)
+```
+```{r}
+cs_tg <- infected_res %>%
+  .[.$symbol %in%cs, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(cs_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(cs_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, cortico-spinal 9",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(cs_tg)[1]
+```
+
+## 3.13 NeuroMuscular
+```{r}
+path<-"path/to/neuromuscularGO"
+
+p1 <- readxl::read_excel(paste0(path,"/GO0007274_term_summary_20231115_225823.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+p2 <- readxl::read_excel(paste0(path,"/GO0050905_term_summary_20231115_225801.xlsx")) %>% 
+  pull(Symbol) %>%
+  unique()
+
+md <- c(p1, p2)
+rm(p1,p2)
+```
+```{r}
+md_tg <- infected_res %>%
+  .[.$symbol %in%md, ] %>%
+  .[.$baseMean > 0, ]  %>%
+  arrange(desc(log2FoldChange), symbol)
+```
+```{r}
+ztrue <- median(abs(md_tg$log2FoldChange))
+median_list <- infected_res %>% 
+  drop_na() %>%
+  .$log2FoldChange# %>%
+  # median()
+znull <- permutate_foldchange(ztrue, median_list, dim(md_tg)[1], sampling=1e5)
+```
+
+```{r}
+hist(znull[[1]], 
+     main = "Histogram of null median expression, neuromuscular 209",
+     xlab = "median log2 fold change",
+     ylab = "Frequency",
+     col = "lightblue",
+     border = "black",
+     breaks = 100
+    )
+abline(v=ztrue, lwd=3, col="red")
+znull[[2]]
+ztrue
+dim(md_tg)[1]
+```
+# 4. Volcano plot
+
+```{r INFECTED volcano plot}
+x_ <- infected_res[infected_res$padj <= 0.5,] #reduce plotted genes just make the plotting faster
+keyvals <- ifelse(
+  x_$log2FoldChange < -0.37 & x_$padj<=0.001 & x_$baseMean > 152, 'slateblue1',
+  ifelse(x_$log2FoldChange > 0.37 & x_$padj<=0.001 & x_$baseMean > 152, 'tomato1','black'))
+# keyvals <- ifelse(
+#   x_$log2FoldChange < -0.37 & x_$padj<=0.001, 'slateblue1',
+#   ifelse(x_$log2FoldChange > 0.37 & x_$padj<=0.001, 'tomato1','black'))
+keyvals[is.na(keyvals)] <- 'black'
+names(keyvals)[keyvals == 'tomato1'] <- 'up-regulated'
+names(keyvals)[keyvals == 'gray30'] <- 'not-significant'
+names(keyvals)[keyvals == 'slateblue1'] <- 'down-regulated'
+
+s_gene <- infected_mock_sig$symbol
+keyvals.shape <- ifelse(
+  x_$symbol %in% s_gene, 19,1) #selected_gene
+keyvals.shape[is.na(keyvals.shape)] <- 1
+names(keyvals.shape)[keyvals.shape == 1] <- 'other'
+names(keyvals.shape)[keyvals.shape == 19] <- 'significant filtered'
+volcano <- EnhancedVolcano(x_,
+                lab = c(''),#,mpro_res$symbol
+                x = 'log2FoldChange',
+                y = 'padj',
+               # selectLab = immuneGene,
+                ylim = c(0,300),
+                # xlim = c(-2,3),
+                #max.overlaps =30,
+                title = "SARS-CoV-2 vs mock",
+                titleLabSize = 18,
+                # subtitle = "inflammation and immune activity genes",
+                xlab = '', #bquote(~Log[2]~ 'fold change'),
+                ylab = '', #bquote(~-Log[10] ~'(adjusted'~ italic(P)  ~ 'value)'),
+                pCutoff = 0.001,
+                cutoffLineType = 'blank',
+                FCcutoff = 0.37, #log2 1.15=0.2
+                pointSize = 2.0,
+                # shape=19,
+                shapeCustom = keyvals.shape,
+                labSize = 0, #5.0,
+                colCustom = keyvals,
+                colAlpha = 0.75,
+                # drawConnectors = TRUE,
+                #widthConnectors = 0.3,
+                legendLabSize = 0, #12,
+                legendPosition = "bottom",
+                legendIconSize = 0, # 4.0,
+                gridlines.major = FALSE,
+                gridlines.minor = FALSE)
+
+```
+```{r}
+yl = 280
+filename <- paste0(writepath,"/Volcano_infected_V4.pdf")
+pdf(filename, width=12, height=9)
+volcano
+dev.off()
+```
+# 5. heatmap for top 20 up and down genes
+```{r}
+y <- infected_mock_sig %>%
+  .[,c("log2FoldChange","symbol")] %>%
+  .[order(-.$log2FoldChange),] 
+top <- y %>% head(20)
+tail <- y %>% tail(20)
+y <- rbind(top, tail)
+names <- y$symbol
+y$symbol <- NULL
+rownames(y) <-names
+colnames(y)[1] <- 'log2 fold change'
+y <- as.matrix(y)
+
+```
+```{r}
+paletteLength <- 50
+# use floor and ceiling to deal with even/odd length pallettelengths
+myBreaks <- c(seq(min(y), 0, length.out=ceiling(paletteLength/2) + 1), 
+              seq(max(y)/paletteLength, max(y), length.out=floor(paletteLength/2)))
+g <- pheatmap(y,
+         gaps_row = 20,
+         cluster_cols=FALSE,
+         cluster_rows=FALSE,
+         fontsize = 20,
+         color=colorRampPalette(c("slateblue1", "white", "tomato1"))(50),
+         breaks=myBreaks)
+g
+filename <- paste0(writepath,"/top20UpDownGenes_010524_v1.pdf")
+pdf(filename, width = 3, height = 12)
+print(g)
+dev.off()
+rm(g, filename)
+```
