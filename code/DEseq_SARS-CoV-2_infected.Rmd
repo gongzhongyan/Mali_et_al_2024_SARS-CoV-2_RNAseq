@@ -1,5 +1,5 @@
 ---
-title: "2024.01.DEseq_SARS-CoV-2_infected"
+title: "DEseq_SARS-CoV-2_infected"
 author: "Zhongyan"
 date: "2024-01-19"
 output: html_document
