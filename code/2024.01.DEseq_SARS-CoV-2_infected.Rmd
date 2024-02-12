@@ -178,7 +178,7 @@ infected_tpm <- read.csv(paste0(path2,"/MusMusculus_INFECTED_tpm.csv"),row.names
 ```{r}
 # prepare the dataframe
 # 1st column gene ID; 2nd col FC
-inf_foldC <- dplyr::select(infected_down, c("symbol","log2FoldChange")) %>% # "symbol" ensgene #infected_mock_sig
+inf_foldC <- dplyr::select(infected_mock_sig, c("symbol","log2FoldChange")) %>% # "symbol" ensgene
   .[order(.$log2FoldChange, decreasing = TRUE),]
 geneList <- inf_foldC[,2]
 names(geneList) = as.character(inf_foldC[,1])
